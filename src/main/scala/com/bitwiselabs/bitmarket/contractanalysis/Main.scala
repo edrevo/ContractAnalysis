@@ -7,20 +7,20 @@ import java.io.File
 object Main {
 
   val optimalSeq: History = List(
-    EnterDepositB(Bob),
-    EnterDepositB(Sam),
-    EnterDepositA(Bob),
-    EnterDepositA(Sam),
+    EnterDeposits(Sam),
+    EnterDeposits(Bob),
+    SignDepositB(Sam),
     TransferMoney,
     SignDepositA(Sam),
-    SignDepositA(Bob),
-    SignDepositB(Sam),
     SignDepositB(Bob),
     StopPlaying(Sam)
   )
 
+  val startFromScratch = State(Sam)
+  val startWithDeposits = Seq(EnterDeposits(Sam), EnterDeposits(Bob)).foldLeft(State(Sam))((s, move) => move(s))
+
   def main(args: Array[String]) {
-    val initialState = State(Bob)
+    val initialState = startFromScratch
     println("Generating game tree...")
     val gameTree = generateGameTree(initialState)
     println("Done")
@@ -28,12 +28,19 @@ object Main {
     println(s"Desired play moves: ${optimalSeq.mkString("\n ")}")
     println()
     println("Resolving tree...")
-    val resolvedTree = resolveTree(gameTree, initialState)
+    val bestStrategies = resolveTree(gameTree, initialState)
     println("Is the desired play moves a dominant strategy? " +
-      resolvedTree.contains(optimalSeq))
-    //println(resolveTree(gameTree, initialState).mkString("\n"))
+      bestStrategies.contains(optimalSeq))
+    
+    printBestStrategies(bestStrategies)
+    new GameGraph(initialState, gameTree, bestStrategies).writeTo(new File("/tmp/game.dot"))
+  }
 
-    new GameGraph(initialState, gameTree, resolvedTree).writeTo(new File("/tmp/game.dot"))
+  def printBestStrategies(strategies: Map[History, Payoff]) {
+    println("Best strategies:")
+    for (((moves, payoff), index) <- strategies.zipWithIndex) {
+      println(s"\t$index: [${payoff(Bob)}, ${payoff(Sam)}] ${moves.map(_.toShortString).mkString(", ")}")
+    }
   }
 
   def generateGameTree(initialState: State): Map[State, MoveMap] = {
@@ -55,12 +62,9 @@ object Main {
   def resolveTree(
       tree: Map[State, MoveMap],
       state: State,
-      seen: Set[State] = Set()): Map[History, Payoff] = {
-    val result: Map[History, Payoff] = if(tree(state).isEmpty) {
-      Map(EmptyHistory -> state.payoff)
-    } else if (seen.contains(state)) {
-      Map(EmptyHistory -> state.payoff)
-    } else {
+      seen: Set[State] = Set()): Map[History, Payoff] =
+    if (tree(state).isEmpty || seen.contains(state)) Map(EmptyHistory -> state.payoff)
+    else {
       val moveMap = tree(state)
       val subGamePayoffs = for {
         (move, newState) <- moveMap
@@ -76,30 +80,25 @@ object Main {
         (history, payoff) <- resolution
       } yield (move :: history).toList -> payoff
     }
-    result
-  }
 }
+
 case class State(
     playerTurn: Value,
     payoff: Payoff = Map(Sam -> ValueSam, Bob -> ValueBob),
     paymentMade: Boolean = false,
-    depositAEntrances: Set[Player] = Set(),
-    depositBEntrances: Set[Player] = Set(),
+    depositEntrances: Set[Player] = Set(),
     depositASignatures: Set[Player] = Set(),
     depositBSignatures: Set[Player] = Set(),
     finished: Boolean = false) {
-  val depositAExists = depositAEntrances == Player.values.toSet
-  val depositBExists = depositBEntrances == Player.values.toSet
+  val depositExists = depositEntrances == Player.values.toSet
   val otherPlayer = playerTurn match {
     case Sam => Bob
     case Bob => Sam
   }
   def changeTurn = copy(playerTurn = otherPlayer)
 
-  if (depositASignatures.nonEmpty)
-    require(depositAExists, this)
-  if (depositBSignatures.nonEmpty)
-    require(depositBExists, this)
+  if (depositASignatures.nonEmpty) require(depositExists, this)
+  if (depositBSignatures.nonEmpty) require(depositExists, this)
   require(payoff.values.forall(_ >= 0), this)
 
   override def toString =
@@ -107,15 +106,14 @@ case class State(
       |\tTurn:                          $playerTurn
       |\tPayoff:                        $payoff
       |\tMoney transferred made:        $paymentMade
-      |\tPeople who entered deposit A:  $depositAEntrances
-      |\tPeople who entered deposit B:  $depositBEntrances
+      |\tPeople who entered deposits:   $depositEntrances
       |\tPeople who signed deposit A:   $depositASignatures
       |\tPeople who signed deposit B:   $depositBSignatures
       |\tDid any player decide to stop? $finished
     """.stripMargin
 }
 
-trait Move extends (State => State) {
+sealed trait Move extends (State => State) {
   val player: Player
   final def canPlay(state: State): Boolean =
     state.playerTurn == player && internalCanPlay(state) && !state.finished
@@ -125,43 +123,36 @@ trait Move extends (State => State) {
 }
 
 object Move {
-  def forPlayers[A](ctor: Player => A) = Player.values.map(ctor)
-  val moves = TransferMoney :: List(EnterDepositA, EnterDepositB, SignDepositA, SignDepositB, StopPlaying).flatMap(forPlayers)
+  def forPlayers[A](ctor: Player => A) = Player.values.map(ctor).toList
+  val moves = {
+    val commonMoves = List(EnterDeposits, SignDepositB, StopPlaying).flatMap(forPlayers)
+    val depositAMoves =
+      if (ContractAmount > DepositA) forPlayers(SignDepositA)
+      else List(SignDepositA(Sam))
+    TransferMoney :: (commonMoves ++ depositAMoves)
+  }
 }
 
-case class EnterDepositA(player: Player) extends Move {
-  protected def internalCanPlay(state: State) = !state.depositAEntrances.contains(player)
+case class EnterDeposits(player: Player) extends Move {
+  protected def internalCanPlay(state: State) = !state.depositEntrances.contains(player)
   def apply(state: State) = {
-    val newState = state.changeTurn.copy(depositAEntrances = state.depositAEntrances + player)
-    if (newState.depositAEntrances == Player.values.toSet)
-      newState.copy(payoff = newState.payoff.mapValues(_ - DepositA))
+    val newState = state.changeTurn.copy(depositEntrances = state.depositEntrances + player)
+    if (newState.depositEntrances == Player.values.toSet)
+      newState.copy(payoff = newState.payoff.mapValues(_ - DepositA - DepositB))
     else
       newState
   }
-  override def toString() = s"Player $player enters deposit A"
+  override def toString() = s"Player $player enters deposits"
   override def toShortString = "enter-A"
 }
 
-case class EnterDepositB(player: Player) extends Move {
-  protected def internalCanPlay(state: State) = !state.depositBEntrances.contains(player)
-  def apply(state: State) = {
-    val newState = state.changeTurn.copy(depositBEntrances = state.depositBEntrances + player)
-    if (newState.depositBEntrances == Player.values.toSet)
-      newState.copy(payoff = newState.payoff.mapValues(_ - DepositB))
-    else
-      newState
-  }
-  override def toString() = s"Player $player enters deposit B"
-  override def toShortString = "enter-B"
-}
-
 case class SignDepositA(player: Player) extends Move {
-  protected def internalCanPlay(state: State) = state.depositAExists && !state.depositASignatures.contains(player)
+  protected def internalCanPlay(state: State) = state.depositExists && !state.depositASignatures.contains(player)
   def apply(state: State) = state.changeTurn.copy(
     depositASignatures = state.depositASignatures + player,
     payoff = state.payoff.collect {
       case (p, v) if p != player && p == Sam => (p, v + DepositA - ContractAmount)
-      case (p, v) if p != player && p == Bob => (p, v + DepositA + ContractAmount)
+      case (p, v) if p != player && p == Bob => (p, v + DepositA + ContractAmount + ConsumerSurplus)
       case other => other
     })
 
@@ -170,7 +161,7 @@ case class SignDepositA(player: Player) extends Move {
 }
 
 case class SignDepositB(player: Player) extends Move {
-  protected def internalCanPlay(state: State) = state.depositBExists && !state.depositBSignatures.contains(player)
+  protected def internalCanPlay(state: State) = state.depositExists && !state.depositBSignatures.contains(player)
   def apply(state: State) = {
     val newState = state.changeTurn.copy(depositBSignatures = state.depositBSignatures + player)
     if (newState.depositBSignatures == Player.values)
@@ -191,12 +182,13 @@ case class StopPlaying(player: Player) extends Move {
 
 object TransferMoney extends Move {
   val player = Bob
-  protected def internalCanPlay(state: State) = !state.paymentMade && state.depositAExists
+  protected def internalCanPlay(state: State) = !state.paymentMade && state.depositExists
   def apply(state: State) = state.changeTurn.copy(
     payoff = Map(
-      Sam -> (state.payoff(Sam) + ContractAmount),
+      Sam -> (state.payoff(Sam) + ContractAmount + ConsumerSurplus),
       Bob -> (state.payoff(Bob) - ContractAmount)),
     paymentMade = true)
   override def toString() = s"Bob transfers money to Sam"
   override def toShortString = "pay-€"
 }
+
